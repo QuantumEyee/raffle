@@ -100,6 +100,59 @@ export async function callMethod(
   return { txHash, result: resultValue, logs };
 }
 
+/**
+ * Fetch a transaction outcome by txHash from NEAR RPC.
+ * Used to retrieve logs/result when we only have the txHash (from server polling).
+ */
+export async function getTransactionOutcome(
+  txHash: string,
+  senderAccountId: string
+): Promise<CallResult> {
+  const res = await fetch(NODE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "dontcare",
+      method: "EXPERIMENTAL_tx_status",
+      params: { tx_hash: txHash, sender_account_id: senderAccountId, wait_until: "EXECUTED_OPTIMISTIC" },
+    }),
+  });
+  const json = await res.json();
+  if (json.error) {
+    throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+  }
+
+  const outcome = json.result;
+
+  // Collect all logs from all receipts
+  const logs: string[] = [];
+  if (outcome.receipts_outcome) {
+    for (const receipt of outcome.receipts_outcome) {
+      if (receipt.outcome?.logs) {
+        logs.push(...receipt.outcome.logs);
+      }
+    }
+  }
+
+  // Parse the final result value
+  let resultValue: unknown = null;
+  const status = outcome.status as Record<string, unknown>;
+  if (status?.SuccessValue) {
+    try {
+      const decoded = Buffer.from(
+        status.SuccessValue as string,
+        "base64"
+      ).toString();
+      resultValue = JSON.parse(decoded);
+    } catch {
+      resultValue = status.SuccessValue;
+    }
+  }
+
+  return { txHash, result: resultValue, logs };
+}
+
 export function generateRandomHex(bytes: number): string {
   const arr = new Uint8Array(bytes);
   crypto.getRandomValues(arr);

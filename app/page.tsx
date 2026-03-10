@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import type {
   PrizeCategoryInput,
   UserId,
@@ -10,7 +10,7 @@ import type {
   DrawMode,
   PrizesDrawnEvent,
 } from "@/lib/types";
-import { generateRandomHex } from "@/lib/near";
+import { generateRandomHex, getTransactionOutcome } from "@/lib/near";
 import { convertMpcSignature } from "@/lib/mpc-signature";
 import { signTeePayload } from "@/lib/tee-signer";
 import {
@@ -23,6 +23,11 @@ import {
   parseRaffleIdFromLogs,
   parsePrizesDrawnEvents,
 } from "@/lib/contracts";
+import {
+  addRandomRecord,
+  pollRandomRecord,
+  updateRandomRecord,
+} from "@/lib/api";
 import { verifyDrawResults, type VerificationResult } from "@/lib/verify";
 
 const USER_ACCOUNT = process.env.NEXT_PUBLIC_USER_ACCOUNT || "";
@@ -73,6 +78,16 @@ export default function Home() {
   // Shared
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState<Record<string, boolean>>({});
+
+  // Server flow state
+  const [requestId, setRequestId] = useState<string | null>(null);
+  const [pendingPayload, setPendingPayload] = useState<{
+    userPayloadJson: string;
+    userSignatureHex: string;
+    priorWinners: string[];
+  } | null>(null);
+  const [polling, setPolling] = useState(false);
+  const pollAbortRef = useRef<AbortController | null>(null);
 
   const addLog = useCallback(
     (
@@ -169,7 +184,7 @@ export default function Home() {
     }
   };
 
-  // --- Step 3: Sign & Draw ---
+  // --- Step 3: Sign & Draw (server flow) ---
   const handleSignAndDraw = async () => {
     if (raffleId === null || !userId || !accountInfo) return;
 
@@ -227,7 +242,109 @@ export default function Home() {
         `signature: ${userSignatureHex.slice(0, 20)}...`
       );
 
-      // Step 3b: Sign TEE payload locally
+      // Save pending payload for Mock TEE
+      setPendingPayload({ userPayloadJson, userSignatureHex, priorWinners });
+
+      // Step 3b: Submit to server
+      const reqId = crypto.randomUUID();
+      setRequestId(reqId);
+
+      addLog(
+        "Submit request",
+        "pending",
+        undefined,
+        `requestId: ${reqId}`
+      );
+      await addRandomRecord(reqId, {
+        user_payload: userPayloadJson,
+        user_signature: userSignatureHex,
+      });
+      addLog("Submit request", "success", undefined, `requestId: ${reqId}`);
+
+      // Step 3c: Poll for result
+      setPolling(true);
+      const abortController = new AbortController();
+      pollAbortRef.current = abortController;
+
+      addLog(
+        "Polling",
+        "pending",
+        undefined,
+        "Waiting for TEE to process (polling every 2s)..."
+      );
+
+      let pollResult: { txHash: string } | { failMsg: string };
+      try {
+        pollResult = await pollRandomRecord(reqId, abortController.signal);
+      } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") {
+          // Polling was aborted (Mock TEE took over)
+          return;
+        }
+        throw e;
+      } finally {
+        setPolling(false);
+        pollAbortRef.current = null;
+      }
+
+      if ("failMsg" in pollResult) {
+        throw new Error(`TEE processing failed: ${pollResult.failMsg}`);
+      }
+
+      // Got txHash from server — fetch transaction outcome
+      addLog(
+        "Fetch tx result",
+        "pending",
+        pollResult.txHash,
+        "Fetching transaction outcome..."
+      );
+      const txResult = await getTransactionOutcome(
+        pollResult.txHash,
+        TEE_ACCOUNT
+      );
+
+      // Collect PrizesDrawn events from tx logs
+      const events = parsePrizesDrawnEvents(txResult.logs);
+      const round: DrawRound = {
+        roundIndex: drawRounds.length,
+        events,
+        priorWinners,
+        txHash: pollResult.txHash,
+      };
+      setDrawRounds((prev) => [...prev, round]);
+
+      addLog(
+        "Generate randomness",
+        "success",
+        pollResult.txHash,
+        `Draw complete, ${events.length} category(s) drawn`
+      );
+
+      // Cleanup
+      setPendingPayload(null);
+      setRequestId(null);
+
+      // Auto fetch results & refresh user info
+      await fetchRaffleResult();
+      await fetchUserInfo();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      addLog("Sign & draw", "error", undefined, msg);
+    } finally {
+      setStepLoading("draw", false);
+    }
+  };
+
+  // --- Mock TEE Draw (local TEE signing + report txHash to server) ---
+  const handleMockDraw = async () => {
+    if (!pendingPayload || !requestId) return;
+
+    setStepLoading("mockDraw", true);
+    try {
+      const { userPayloadJson, userSignatureHex, priorWinners } =
+        pendingPayload;
+
+      // Local TEE sign
       const teeRandomSeed = generateRandomHex(32);
       const { teePayload, teeSignature } = signTeePayload(
         userPayloadJson,
@@ -235,11 +352,11 @@ export default function Home() {
         teeRandomSeed,
         TEE_PRIVATE_KEY
       );
-      addLog("TEE sign", "success", undefined, "Local Ed25519 signing done");
+      addLog("Mock TEE sign", "success", undefined, "Local Ed25519 signing done");
 
-      // Step 3c: Generate randomness (draw)
+      // Call generate_random_number on contract
       addLog(
-        "Generate randomness",
+        "Mock generate randomness",
         "pending",
         undefined,
         "Calling generate_random_number..."
@@ -251,7 +368,19 @@ export default function Home() {
         tee_signature: teeSignature,
       });
 
-      // Collect PrizesDrawn events from tx logs
+      // Report txHash to server
+      await updateRandomRecord(requestId, drawResult.txHash);
+      addLog(
+        "Mock update server",
+        "success",
+        undefined,
+        `txHash reported: ${drawResult.txHash.slice(0, 16)}...`
+      );
+
+      // Abort polling (server flow will see AbortError and return)
+      pollAbortRef.current?.abort();
+
+      // Process result locally
       const events = parsePrizesDrawnEvents(drawResult.logs);
       const round: DrawRound = {
         roundIndex: drawRounds.length,
@@ -262,19 +391,25 @@ export default function Home() {
       setDrawRounds((prev) => [...prev, round]);
 
       addLog(
-        "Generate randomness",
+        "Mock generate randomness",
         "success",
         drawResult.txHash,
         `Draw complete, ${events.length} category(s) drawn`
       );
+
+      // Cleanup
+      setPendingPayload(null);
+      setRequestId(null);
+      setPolling(false);
 
       // Auto fetch results & refresh user info
       await fetchRaffleResult();
       await fetchUserInfo();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      addLog("Sign & draw", "error", undefined, msg);
+      addLog("Mock TEE draw", "error", undefined, msg);
     } finally {
+      setStepLoading("mockDraw", false);
       setStepLoading("draw", false);
     }
   };
@@ -342,7 +477,7 @@ export default function Home() {
       {/* Config Info */}
       <section className="p-4 bg-gray-100 dark:bg-gray-800 rounded-lg text-sm font-mono space-y-1">
         <div>User: {USER_ACCOUNT}</div>
-        <div>TEE: {TEE_ACCOUNT}</div>
+        {/* <div>TEE: {TEE_ACCOUNT}</div> */}
         <div>Randomness Contract: {RANDOMNESS_CONTRACT}</div>
         <div>Raffle Contract: {RAFFLE_CONTRACT}</div>
         <div>Token: {TOKEN}</div>
@@ -498,17 +633,35 @@ export default function Home() {
           )}
 
           <div className="text-xs text-gray-500">
-            Flow: Build UserPayload &rarr; MPC Sign (~10-30s) &rarr; TEE Local
-            Sign &rarr; generate_random_number &rarr; Callback Draw
+            Flow: Build UserPayload &rarr; MPC Sign (~10-30s) &rarr; Submit to
+            Server &rarr; Poll for Result
           </div>
 
-          <button
-            className="bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700 disabled:opacity-50"
-            onClick={handleSignAndDraw}
-            disabled={loading.draw}
-          >
-            {loading.draw ? "Drawing..." : "Sign & Draw"}
-          </button>
+          <div className="flex gap-4 items-center">
+            <button
+              className="bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700 disabled:opacity-50"
+              onClick={handleSignAndDraw}
+              disabled={loading.draw || loading.mockDraw}
+            >
+              {loading.draw ? "Drawing..." : "Sign & Draw"}
+            </button>
+
+            {/* {polling && pendingPayload && (
+              <button
+                className="bg-yellow-600 text-white px-6 py-2 rounded hover:bg-yellow-700 disabled:opacity-50"
+                onClick={handleMockDraw}
+                disabled={loading.mockDraw}
+              >
+                {loading.mockDraw ? "Mock Processing..." : "Mock TEE Draw"}
+              </button>
+            )} */}
+
+            {polling && (
+              <span className="text-yellow-500 text-sm animate-pulse">
+                Polling for result...
+              </span>
+            )}
+          </div>
         </section>
       )}
 
